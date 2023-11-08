@@ -14,6 +14,11 @@ public class Config {
 	@Parameter(names = "-o", description = "output folder for clips")
 	private String outputFolder = "output_clips";
 	@Getter
+	@Setter
 	@Parameter(names = "-channel", description = "channel name", required = true)
 	private String channelName;
+	@Getter
+	@Setter
+	@Parameter(names = "-offset", description = "clip offset in seconds")
+	private long segmentOffsetSeconds = 5;
 }

@@ -5,6 +5,7 @@ target/
 output_clips/
 *.mp4
 *.jar
+*.m3u8
 
 ### IntelliJ IDEA ###
 .idea/modules.xml

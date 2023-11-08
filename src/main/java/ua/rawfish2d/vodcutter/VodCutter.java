@@ -1,19 +1,16 @@
 package ua.rawfish2d.vodcutter;
 
 import com.beust.jcommander.JCommander;
-import org.delfic.mutedvodsements.MutedVodSegmentsDetector;
-import org.delfic.mutedvodsements.Segment;
 import org.delfic.videolister.ListLatestFilianVideos;
 
-import java.io.File;
-import java.io.IOException;
-import java.io.InputStream;
+import java.io.*;
+import java.net.URL;
 import java.time.LocalDate;
 import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
 import java.util.Scanner;
-import java.util.SortedSet;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import java.util.stream.Collectors;
@@ -76,35 +73,37 @@ public class VodCutter {
 			final String vodFileName = getVodFileNameWithDate(formattedDate);
 			// if local vod with same date found then
 			if (vodFileName != null) {
-				final String vodLink = "https://www.twitch.tv/videos/" + vodID;
 				System.out.println("\n====================");
 				System.out.printf("Twitch VOD. Date: %s link: %s\n", formattedDate, vodID);
 				System.out.printf("Found local VOD with same date %s\n", vodFileName);
 				System.out.printf("Local VOD duration: %s\n", getVodDuration(vodsFolder + vodFileName));
-				// get muted segments from twitch vod
-				SortedSet<Segment> segments = null;
-				// I guess selenium, twitch and internet connection are not perfect
-				// so it works better with multiple attempts
-				while (true) {
-					try {
-						segments = MutedVodSegmentsDetector.getMutedSegmentsFromUrl(vodLink);
-						// if this attempt is successful, stop attempting
+
+				final int attemptsMax = 5;
+				String m3u8link = "";
+				for (int a = 0; a < attemptsMax; ++a) {
+					m3u8link = getM3U8link(vodID);
+					if (m3u8link.equals("null")) {
+						System.err.println("Error! Can't get m3u8 link for some reason...\nTrying again... " + a + "/" + attemptsMax);
+					} else {
 						break;
-					} catch (Exception ex) {
-						System.err.println("Error: " + ex.getMessage());
-						System.out.println("Exception occurred while trying to get muted segments from vod (link: " + vodLink + " date: " + formattedDate + ")");
-						System.out.println("Trying again...");
 					}
 				}
+				String m3u8data = "";
+				for (int a = 0; a < attemptsMax; ++a) {
+					try {
+						m3u8data = downloadM3U8(m3u8link, vodID + "_" + formattedDate);
+					} catch (IOException e) {
+						e.printStackTrace();
+						System.err.println("Exception while downloading m3u8 file...\nTrying again... " + a + "/" + attemptsMax);
+					}
+				}
+				final List<Segment> segments = parseM3U8(m3u8data);
 				// loop for cutting out unmuted segments from local vod
 				int clipID = 0;
+				System.out.println("Starting ffmpeg to cut out unmuted parts from " + vodFileName);
 				for (Segment segment : segments) {
-					if (!segment.isMuted()) {
-						continue;
-					}
-					final String segmentTime = segment.toString();
-					System.out.println("Starting ffmpeg to cut out unmuted parts from " + vodFileName);
-					cutVod(vodFileName, segmentTime, clipID, formattedDate);
+					System.out.println("Cutting out part " + segment.toString() + " from VOD (" + formattedDate + ") " + vodFileName);
+					cutVod(vodFileName, segment.getStartTime(), segment.getDurationTime(), clipID, formattedDate);
 					clipID++;
 				}
 			}
@@ -121,13 +120,79 @@ public class VodCutter {
 		return "null";
 	}
 
-	private void cutVod(String vodFileName, String segmentTime, int clipID, String vodDate) {
-		final String[] split = segmentTime.split("-");
-		if (split.length != 2) {
-			throw new RuntimeException("Something went horribly wrong! Segment time format is invalid! " + segmentTime);
+	private String getM3U8link(String vodID) {
+		final String command = "streamlink --url https://www.twitch.tv/videos/" + vodID + " --default-stream best --stream-url";
+		final String result = execCmd(command);
+		if (result != null) {
+			return result.trim();
 		}
-		final String segmentStartTime = split[0];
-		final String segmentDurationTime = split[1];
+		return "null";
+	}
+
+	private String downloadM3U8(String link, String fileName) throws IOException {
+		final StringBuilder m3u8 = new StringBuilder();
+		try (BufferedInputStream in = new BufferedInputStream(new URL(link).openStream());
+		     FileOutputStream fileOutputStream = new FileOutputStream(fileName + ".m3u8")) {
+			byte[] dataBuffer = new byte[1024];
+			int bytesRead;
+
+			while ((bytesRead = in.read(dataBuffer, 0, 1024)) != -1) {
+				String str = new String(dataBuffer, 0, bytesRead);
+				m3u8.append(str);
+				fileOutputStream.write(dataBuffer, 0, bytesRead); // write it to file for debugging purposes
+			}
+			fileOutputStream.flush();
+		}
+		return m3u8.toString();
+	}
+
+	private List<Segment> parseM3U8(final String m3u8data) {
+		final List<Segment> segments = new ArrayList<>();
+		final String[] m3u8lines = m3u8data.split("\n");
+		double currentSeconds = 0;
+		double prevDuration = 0;
+		double vodDurationSeconds = 0;
+
+		double mutedSegmentStartSeconds = 0;
+		boolean inMutedSegment = false;
+		for (int a = 0; a < m3u8lines.length; ++a) {
+			final String line = m3u8lines[a].toUpperCase(); // to upper case just in case xd
+			if (!line.equals("#EXTM3U") && a == 0) {
+				System.out.println("Not M3U8!");
+				break;
+			}
+			if (line.startsWith("#EXTINF:")) {
+				final String[] split = line.split(":"); // #EXTINF:10.000,
+				final String time = split[1].replaceAll(",", ""); // remove , from the end of the line
+				prevDuration = Double.parseDouble(time);
+			}
+			if (line.startsWith("#EXT-X-TWITCH-TOTAL-SECS:")) {
+				final String[] split = line.split(":"); // #EXT-X-TWITCH-TOTAL-SECS:15500.963
+				final String time = split[1].replaceAll(",", ""); // remove , from the end of the line
+				vodDurationSeconds = Double.parseDouble(time);
+			}
+			if (line.endsWith(".TS")) { // 22-MUTED.TS
+				if (line.contains("MUTED")) {
+					if (!inMutedSegment) {
+						inMutedSegment = true;
+						mutedSegmentStartSeconds = currentSeconds;
+					}
+				} else if (inMutedSegment) {
+					segments.add(new Segment(mutedSegmentStartSeconds, currentSeconds + prevDuration, vodDurationSeconds, config.getSegmentOffsetSeconds()));
+					inMutedSegment = false;
+					mutedSegmentStartSeconds = 0;
+				}
+				currentSeconds += prevDuration;
+			}
+			if (line.equals("#EXT-X-ENDLIST")) {
+				break;
+			}
+		}
+		segments.forEach(segment -> System.out.println("Muted segment: " + segment.toString()));
+		return segments;
+	}
+
+	private void cutVod(String vodFileName, String segmentStartTime, String segmentDurationTime, int clipID, String vodDate) {
 		final String clipFileName = config.getOutputFolder() + config.getChannelName() + "_clip" + clipID + "_" + segmentStartTime.replace(":", "-") + "_" + vodDate;
 		final String command = "ffmpeg -hide_banner -ss " + segmentStartTime +
 				" -accurate_seek -i \"" + config.getVodsFolder() + vodFileName + "\" -t " + segmentDurationTime +
